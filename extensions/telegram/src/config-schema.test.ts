@@ -594,3 +594,15 @@ describe("telegram webhook schema", () => {
     );
   });
 });
+
+describe("telegram action gates", () => {
+  // The runtime refuses dice unless this gate is true, so the key must exist in the
+  // schema: without it the config is rejected outright and the action is unreachable.
+  it("accepts the dice gate", () => {
+    expectTelegramConfigValid({ botToken: "fake", actions: { dice: true } });
+  });
+
+  it("still rejects an unknown action gate", () => {
+    expectTelegramConfigIssue({ botToken: "fake", actions: { roulette: true } }, "actions");
+  });
+});
