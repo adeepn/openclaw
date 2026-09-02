@@ -595,10 +595,11 @@ curl "https://api.telegram.org/bot<bot_token>/getUpdates"
     - `deleteMessage` (`chatId`, `messageId`)
     - `editMessage` (`chatId`, `messageId`, `content` or `caption`, optional `presentation` inline buttons; button-only edits update reply markup)
     - `createForumTopic` (`chatId`, `name`, optional `iconColor`, `iconCustomEmojiId`)
+    - `sendDice` (`to`, optional `diceEmoji`, `replyToMessageId`, `messageThreadId`)
 
-    Ergonomic aliases: `send`, `react`, `delete`, `edit`, `sticker`, `sticker-search`, `topic-create`.
+    Ergonomic aliases: `send`, `react`, `delete`, `edit`, `sticker`, `sticker-search`, `dice`, `topic-create`.
 
-    Gating: `channels.telegram.actions.sendMessage`, `deleteMessage`, `reactions`, `sticker` (default: disabled). `reactions` controls both `react` and `emoji-list`. `edit`, `createForumTopic`, and `editForumTopic` are enabled by default with no dedicated toggle.
+    Gating: `channels.telegram.actions.sendMessage`, `deleteMessage`, `reactions`, `sticker`, `dice` (default: disabled). `reactions` controls both `react` and `emoji-list`. `edit`, `createForumTopic`, and `editForumTopic` are enabled by default with no dedicated toggle.
     Runtime sends use the active config/secrets snapshot from startup/reload, so action paths do not re-resolve `SecretRef` values per send.
 
     Use `emoji-list` to inspect reactions in the current trusted chat and account. Agents cannot inspect another chat; direct operators may provide a different `chatId`. `limit` defaults to and cannot exceed 100:
@@ -616,6 +617,31 @@ curl "https://api.telegram.org/bot<bot_token>/getUpdates"
     Pass a Unicode identifier or numeric custom emoji identifier directly to `react`. Chats without reaction restrictions return the known standard Telegram reactions and a `note` explaining that all standard reactions are allowed. When Telegram rejects a reaction and the chat's allowed Unicode reactions are known, the error includes a short sample of valid alternatives.
 
     Reaction removal semantics: [/tools/reactions](/tools/reactions).
+
+  </Accordion>
+
+  <Accordion title="Dice rolls">
+    Telegram's `sendDice` plays an animated roll and picks the outcome server-side. The value cannot be requested, which is the point: neither the agent nor the operator can influence it, so a roll shown in chat is verifiable by everyone who sees the animation.
+
+    Enable it:
+
+```json
+{
+  "channels": {
+    "telegram": {
+      "actions": { "dice": true }
+    }
+  }
+}
+```
+
+    Then call the message tool with `action: "dice"`:
+
+```json
+{ "action": "dice", "to": "-1001234567890", "diceEmoji": "🎲" }
+```
+
+    `diceEmoji` accepts 🎲 🎯 🏀 ⚽ 🎳 🎰 and defaults to 🎲; it has its own name so enabling dice does not retitle the `emoji` parameter reactions use. A trailing emoji presentation selector (⚽️) is accepted and normalized; any other value is rejected before the request is sent. Each emoji has its own value range (1-6 for 🎲 🎯 🎳, 1-5 for 🏀 ⚽, 1-64 for 🎰). The result carries `messageId`, `chatId`, `emoji`, and the rolled `value`, so the caller learns the outcome immediately without re-reading the chat.
 
   </Accordion>
 
@@ -1021,7 +1047,7 @@ Primary reference: [Configuration reference - Telegram](/gateway/config-channels
 - media/network: `mediaMaxMb`, `network.autoSelectFamily`, `network.dangerouslyAllowPrivateNetwork`, `proxy`
 - custom API root: `apiRoot` (Bot API root only; do not include `/bot<TOKEN>`), `trustedLocalFileRoots` (self-hosted Bot API absolute `file_path` roots)
 - webhook: `webhookUrl`, `webhookSecret`, `webhookPath`, `webhookHost`, `webhookPort`, `webhookCertPath`
-- actions/capabilities: `capabilities.inlineButtons`, `actions.sendMessage|editMessage|deleteMessage|reactions|sticker|createForumTopic|editForumTopic`
+- actions/capabilities: `capabilities.inlineButtons`, `actions.sendMessage|editMessage|deleteMessage|reactions|sticker|dice|createForumTopic|editForumTopic`
 - reactions: `reactionNotifications`, `reactionLevel`
 - errors: `errorPolicy`, `silentErrorReplies`
 - writes/history: `configWrites`, `historyLimit`, `dmHistoryLimit`, `dms.*.historyLimit`

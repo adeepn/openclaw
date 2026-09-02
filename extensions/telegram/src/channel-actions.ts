@@ -42,6 +42,7 @@ const telegramMessageActionRuntime = {
 
 const TELEGRAM_MESSAGE_ACTION_MAP = {
   delete: "deleteMessage",
+  dice: "sendDice",
   edit: "editMessage",
   "emoji-list": "emoji-list",
   poll: "poll",
@@ -64,7 +65,9 @@ const TELEGRAM_TOOL_DELIVERY_ACTIONS = new Set([
   "react",
   "send",
   "sendMessage",
+  "sendDice",
   "sendSticker",
+  "dice",
   "sticker",
   "topic-create",
   "topic-edit",
@@ -191,6 +194,9 @@ function describeTelegramMessageTool({
   if (discovery.isEnabled("sticker", false)) {
     actions.add("sticker");
     actions.add("sticker-search");
+  }
+  if (discovery.isEnabled("dice", false)) {
+    actions.add("dice");
   }
   if (discovery.isEnabled("createForumTopic")) {
     actions.add("topic-create");

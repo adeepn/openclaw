@@ -25,6 +25,8 @@ export type TelegramActionConfig = {
   editMessage?: boolean;
   /** Enable sticker actions (send and search). */
   sticker?: boolean;
+  /** Enable dice actions. Telegram rolls the value server-side; it cannot be requested. */
+  dice?: boolean;
   /** Enable forum topic creation. */
   createForumTopic?: boolean;
   /** Enable forum topic editing (rename / change icon). */
