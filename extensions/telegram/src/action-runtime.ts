@@ -1023,6 +1023,7 @@ export async function handleTelegramAction(
       cfg,
       token,
       accountId: accountId ?? undefined,
+      silent: readBooleanParam(params, "silent"),
       replyToMessageId: replyToMessageId ?? undefined,
       messageThreadId: messageThreadId ?? undefined,
       gatewayClientScopes: options?.gatewayClientScopes,
