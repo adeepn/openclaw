@@ -1,0 +1,957 @@
+From 0c5b90ff0a2c746da2a23cf4c8fc565e8ed37e47 Mon Sep 17 00:00:00 2001
+From: Viacheslav Bocharov <v@baodeep.com>
+Date: Sun, 13 Sep 2026 15:14:21 +0300
+Subject: [PATCH 2/2] feat(telegram): add a dice action to the message tool
+
+Telegram sendDice plays an animated roll and picks the outcome
+server-side, so a roll a bot posts is verifiable by everyone who watches
+the animation. Posting the emoji as text only produces a static picture,
+and the Bot API method was unreachable from OpenClaw.
+
+Add dice to the core action vocabulary with target mode "to" and no
+conversation read, plus a scoped schema group carrying one optional emoji
+param, so a dice-only tool surface advertises the six faces Telegram
+supports instead of none. The Telegram runtime wraps sendDice and returns
+messageId, chatId, emoji, and the rolled value, so the caller learns the
+outcome from the same tool result instead of re-reading the chat. The
+action rides the existing channels.telegram.actions.sendMessage gate
+instead of carrying one of its own: a roll is an ordinary outbound message
+to a chat the bot may already post in.
+
+Two shared classifications every other recipient-visible send belongs to
+are completed here. Cross-context egress: enforceCrossContextPolicy returns
+before comparing targets for an action missing from CONTEXT_GUARDED_ACTIONS,
+so a bound run could roll into another configured chat with cross-context
+delivery disabled. Terminal delivery: a roll delivered to the run's own
+conversation was not recognised as the run's visible reply, so the run sent
+a redundant fallback reply after the roll had landed; mirrorable payload
+eligibility is now separate from target-addressed delivery classification,
+which also keeps poll params out of the transcript. The handler forwards
+the silent option its schema already advertised.
+
+Upstream: https://github.com/openclaw/openclaw/pull/138202
+---
+ .../telegram/src/action-runtime.test.ts       | 25 +++++
+ extensions/telegram/src/action-runtime.ts     | 38 ++++++++
+ .../src/channel-actions.contract.test.ts      |  1 +
+ .../telegram/src/channel-actions.test.ts      | 18 ++++
+ extensions/telegram/src/channel-actions.ts    |  6 ++
+ .../telegram/src/send-special.dice.test.ts    | 87 +++++++++++++++++
+ extensions/telegram/src/send-special.ts       | 93 +++++++++++++++++++
+ extensions/telegram/src/send.ts               |  2 +-
+ ...ed-agent-message-tool-source-reply.test.ts | 29 ++++++
+ ...mbedded-agent-message-tool-source-reply.ts |  7 +-
+ .../tools/message-tool-schema-scoping.ts      |  2 +
+ .../tools/message-tool-schema.dice.test.ts    | 46 +++++++++
+ src/agents/tools/message-tool-schema.ts       | 16 ++++
+ .../plugins/message-action-dispatch.ts        |  2 +
+ src/channels/plugins/message-action-names.ts  |  1 +
+ ...sage-action-execution.reply-action.test.ts | 21 ++++-
+ .../message-action-runner.test-support.ts     | 26 +++++-
+ .../outbound/message-action-spec.test.ts      |  8 ++
+ src/infra/outbound/message-action-spec.ts     |  1 +
+ src/infra/outbound/outbound-policy.test.ts    | 16 ++++
+ src/infra/outbound/outbound-policy.ts         |  3 +
+ .../outbound/source-reply-mirror.test.ts      | 56 +++++++++++
+ src/infra/outbound/source-reply-mirror.ts     | 35 +++++--
+ 23 files changed, 526 insertions(+), 13 deletions(-)
+ create mode 100644 extensions/telegram/src/send-special.dice.test.ts
+ create mode 100644 src/agents/tools/message-tool-schema.dice.test.ts
+
+diff --git a/extensions/telegram/src/action-runtime.test.ts b/extensions/telegram/src/action-runtime.test.ts
+index ddd85680e70..88520a3f81a 100644
+--- a/extensions/telegram/src/action-runtime.test.ts
++++ b/extensions/telegram/src/action-runtime.test.ts
+@@ -195,6 +195,12 @@ const sendStickerTelegram = vi.fn(async () => ({
+   messageId: "456",
+   chatId: "123",
+ }));
++const sendDiceTelegram = vi.fn(async () => ({
++  messageId: "801",
++  chatId: "123",
++  emoji: "\u{1F3B2}",
++  value: 4,
++}));
+ const deleteMessageTelegram = vi.fn(async () => ({ ok: true }));
+ const editMessageTelegram = vi.fn(async () => ({
+   ok: true,
+@@ -364,6 +370,7 @@ describe("handleTelegramAction", () => {
+       sendMessageTelegram,
+       sendPollTelegram,
+       sendStickerTelegram,
++      sendDiceTelegram,
+       deleteMessageTelegram,
+       editMessageTelegram,
+       editMessageReplyMarkupTelegram,
+@@ -377,6 +384,7 @@ describe("handleTelegramAction", () => {
+     sendMessageTelegram.mockClear();
+     sendPollTelegram.mockClear();
+     sendStickerTelegram.mockClear();
++    sendDiceTelegram.mockClear();
+     deleteMessageTelegram.mockClear();
+     editMessageTelegram.mockClear();
+     editMessageReplyMarkupTelegram.mockClear();
+@@ -1606,6 +1614,23 @@ describe("handleTelegramAction", () => {
+     expect(details.pollId).toBe("poll-1");
+   });
+ 
++  it("forwards the silent option to a dice roll", async () => {
++    // The shared schema accepts `silent` for dice and the sender supports it; dropping it
++    // here made silent rolls notify recipients anyway.
++    const result = await handleTelegramAction(
++      { action: "dice", to: "@testchannel", diceEmoji: "\u{1F3B2}", silent: true },
++      telegramConfig(),
++    );
++    const call = mockCall(sendDiceTelegram, 0, "send dice");
++    expect(call[0]).toBe("@testchannel");
++    expect(call[1]).toBe("\u{1F3B2}");
++    const options = requireRecord(call[2], "send dice options");
++    expect(options.silent).toBe(true);
++    const details = resultDetails(result);
++    expect(details.ok).toBe(true);
++    expect(details.value).toBe(4);
++  });
++
+   it("returns a model-visible warning when public poll routing is unavailable", async () => {
+     sendPollTelegram.mockResolvedValueOnce({
+       messageId: "790",
+diff --git a/extensions/telegram/src/action-runtime.ts b/extensions/telegram/src/action-runtime.ts
+index 93dab210a07..a1e4c6365c7 100644
+--- a/extensions/telegram/src/action-runtime.ts
++++ b/extensions/telegram/src/action-runtime.ts
+@@ -62,6 +62,7 @@ import {
+   getTelegramAllowedReactions,
+   pinMessageTelegram,
+   reactMessageTelegram,
++  sendDiceTelegram,
+   sendMessageTelegram,
+   sendPollTelegram,
+   sendStickerTelegram,
+@@ -83,6 +84,7 @@ export const telegramActionRuntime = {
+   pinMessageTelegram,
+   reactMessageTelegram,
+   searchStickers,
++  sendDiceTelegram,
+   sendDurableMessageBatch,
+   sendMessageTelegram,
+   sendPollTelegram,
+@@ -106,6 +108,8 @@ const TELEGRAM_ACTION_ALIASES = {
+   react: "react",
+   searchSticker: "searchSticker",
+   send: "sendMessage",
++  dice: "sendDice",
++  sendDice: "sendDice",
+   sendMessage: "sendMessage",
+   sendSticker: "sendSticker",
+   sticker: "sendSticker",
+@@ -989,6 +993,40 @@ export async function handleTelegramAction(
+     });
+   }
+ 
++  if (action === "sendDice") {
++    if (!isActionEnabled("sendMessage")) {
++      throw new Error("Telegram sendMessage is disabled.");
++    }
++    const to =
++      readStringParam(params, "to") ?? readStringParam(params, "target", { required: true });
++    const emoji = readStringParam(params, "diceEmoji");
++    const replyToMessageId = readTelegramReplyToMessageId(params);
++    const messageThreadId = readTelegramThreadId(params);
++    const token = resolveTelegramToken(cfg, { accountId }).token;
++    if (!token) {
++      throw new Error(
++        "Telegram bot token missing. Set TELEGRAM_BOT_TOKEN or channels.telegram.botToken.",
++      );
++    }
++    const result = await telegramActionRuntime.sendDiceTelegram(to, emoji ?? undefined, {
++      cfg,
++      token,
++      accountId: accountId ?? undefined,
++      silent: readBooleanParam(params, "silent"),
++      replyToMessageId: replyToMessageId ?? undefined,
++      messageThreadId: messageThreadId ?? undefined,
++      gatewayClientScopes: options?.gatewayClientScopes,
++    });
++    notifyVisibleOutboundSuccess(to, messageThreadId);
++    return jsonResult({
++      ok: true,
++      messageId: result.messageId,
++      chatId: result.chatId,
++      emoji: result.emoji,
++      value: result.value,
++    });
++  }
++
+   if (action === "sendSticker") {
+     if (!isActionEnabled("sticker", false)) {
+       throw new Error(
+diff --git a/extensions/telegram/src/channel-actions.contract.test.ts b/extensions/telegram/src/channel-actions.contract.test.ts
+index 9fa175ca7f4..8ede06c8e74 100644
+--- a/extensions/telegram/src/channel-actions.contract.test.ts
++++ b/extensions/telegram/src/channel-actions.contract.test.ts
+@@ -19,6 +19,7 @@ describe("telegram actions contract", () => {
+         } as OpenClawConfig,
+         expectedActions: [
+           "send",
++          "dice",
+           "poll",
+           "react",
+           "emoji-list",
+diff --git a/extensions/telegram/src/channel-actions.test.ts b/extensions/telegram/src/channel-actions.test.ts
+index 1571a8bba17..58dfc202786 100644
+--- a/extensions/telegram/src/channel-actions.test.ts
++++ b/extensions/telegram/src/channel-actions.test.ts
+@@ -250,6 +250,24 @@ describe("telegramMessageActions", () => {
+     }
+   });
+ 
++  it("ties dice availability to the send gate", () => {
++    // Dice has no gate of its own: it is an ordinary outbound message, so disabling sending
++    // must withdraw it rather than leave it reachable through the tool surface.
++    const actionsFor = (cfg: OpenClawConfig) =>
++      telegramMessageActions.describeMessageTool?.({ cfg })?.actions ?? [];
++
++    expect(actionsFor({ channels: { telegram: { botToken: "tok" } } } as OpenClawConfig)).toContain(
++      "dice",
++    );
++    expect(
++      actionsFor({
++        channels: {
++          telegram: { botToken: "tok", actions: { sendMessage: false } },
++        },
++      } as OpenClawConfig),
++    ).not.toContain("dice");
++  });
++
+   it("lists sticker actions only when enabled by config", () => {
+     const cases = [
+       {
+diff --git a/extensions/telegram/src/channel-actions.ts b/extensions/telegram/src/channel-actions.ts
+index 6d74b74ca3b..e4ae0af53b5 100644
+--- a/extensions/telegram/src/channel-actions.ts
++++ b/extensions/telegram/src/channel-actions.ts
+@@ -40,6 +40,7 @@ const telegramMessageActionRuntime = {
+ 
+ const TELEGRAM_MESSAGE_ACTION_MAP = {
+   delete: "deleteMessage",
++  dice: "sendDice",
+   edit: "editMessage",
+   "emoji-list": "emoji-list",
+   poll: "poll",
+@@ -62,7 +63,9 @@ const TELEGRAM_TOOL_DELIVERY_ACTIONS = new Set([
+   "react",
+   "send",
+   "sendMessage",
++  "sendDice",
+   "sendSticker",
++  "dice",
+   "sticker",
+   "topic-create",
+   "topic-edit",
+@@ -153,6 +156,9 @@ function describeTelegramMessageTool({
+   const actions = new Set<ChannelMessageActionName>();
+   if (discovery.isEnabled("sendMessage")) {
+     actions.add("send");
++    // A roll is an ordinary outbound message to a chat the bot may already post in, so it
++    // rides the send gate instead of a dedicated toggle.
++    actions.add("dice");
+   }
+   if (discovery.pollEnabled) {
+     actions.add("poll");
+diff --git a/extensions/telegram/src/send-special.dice.test.ts b/extensions/telegram/src/send-special.dice.test.ts
+new file mode 100644
+index 00000000000..a7a800d232e
+--- /dev/null
++++ b/extensions/telegram/src/send-special.dice.test.ts
+@@ -0,0 +1,87 @@
++// Telegram tests cover sendDice outbound behavior.
++import { describe, expect, it, vi } from "vitest";
++import { sendDiceTelegram } from "./send-special.js";
++import { makeTelegramApiTestMock } from "./send.test-harness.js";
++
++const TEST_CFG = { session: { store: ":memory:" } } as never;
++
++describe("sendDiceTelegram", () => {
++  it("defaults to 🎲 and returns the server-rolled value", async () => {
++    const chatId = "123";
++    const sendDice = vi.fn().mockResolvedValue({
++      message_id: 200,
++      chat: { id: chatId },
++      dice: { emoji: "🎲", value: 4 },
++    });
++
++    const res = await sendDiceTelegram(chatId, undefined, {
++      cfg: TEST_CFG,
++      token: "tok",
++      api: makeTelegramApiTestMock({ sendDice }),
++    });
++
++    expect(sendDice).toHaveBeenCalledWith(chatId, "🎲", undefined);
++    expect(res.messageId).toBe("200");
++    expect(res.chatId).toBe(chatId);
++    expect(res.emoji).toBe("🎲");
++    expect(res.value).toBe(4);
++  });
++
++  it.each(["🎲", "🎯", "🏀", "⚽", "🎳", "🎰"])("passes the %s face through", async (emoji) => {
++    const sendDice = vi.fn().mockResolvedValue({
++      message_id: 201,
++      chat: { id: "123" },
++      dice: { emoji, value: 6 },
++    });
++
++    const res = await sendDiceTelegram("123", emoji, {
++      cfg: TEST_CFG,
++      token: "tok",
++      api: makeTelegramApiTestMock({ sendDice }),
++    });
++
++    expect(sendDice).toHaveBeenCalledWith("123", emoji, undefined);
++    expect(res.emoji).toBe(emoji);
++    expect(res.value).toBe(6);
++  });
++
++  it("accepts a face carrying the emoji presentation selector", async () => {
++    const sendDice = vi.fn().mockResolvedValue({
++      message_id: 203,
++      chat: { id: "123" },
++      dice: { emoji: "⚽", value: 3 },
++    });
++
++    await sendDiceTelegram("123", "⚽\uFE0F", {
++      cfg: TEST_CFG,
++      token: "tok",
++      api: makeTelegramApiTestMock({ sendDice }),
++    });
++
++    expect(sendDice).toHaveBeenCalledWith("123", "⚽", undefined);
++  });
++
++  it("rejects an unsupported emoji before calling the API", async () => {
++    const sendDice = vi.fn();
++    await expect(
++      sendDiceTelegram("123", "🎈", {
++        cfg: TEST_CFG,
++        token: "tok",
++        api: makeTelegramApiTestMock({ sendDice }),
++      }),
++    ).rejects.toThrow(/Unsupported Telegram dice emoji/u);
++    expect(sendDice).not.toHaveBeenCalled();
++  });
++
++  it("omits the value when Telegram returns no dice payload", async () => {
++    const sendDice = vi.fn().mockResolvedValue({ message_id: 202, chat: { id: "123" } });
++
++    const res = await sendDiceTelegram("123", "🎲", {
++      cfg: TEST_CFG,
++      token: "tok",
++      api: makeTelegramApiTestMock({ sendDice }),
++    });
++
++    expect(res.value).toBeUndefined();
++  });
++});
+diff --git a/extensions/telegram/src/send-special.ts b/extensions/telegram/src/send-special.ts
+index fa0127aa8cf..4a5e11857a2 100644
+--- a/extensions/telegram/src/send-special.ts
++++ b/extensions/telegram/src/send-special.ts
+@@ -92,6 +92,99 @@ type TelegramPollOpts = TelegramThreadedSendOpts &
+     isAnonymous?: boolean;
+   };
+ 
++/** Emoji accepted by Telegram's sendDice, with the value range each one resolves to. */
++const TELEGRAM_DICE_EMOJI = ["🎲", "🎯", "🏀", "⚽", "🎳", "🎰"] as const;
++
++type TelegramDiceEmoji = (typeof TELEGRAM_DICE_EMOJI)[number];
++
++type TelegramDiceOpts = TelegramThreadedSendOpts &
++  Pick<TelegramSendOpts, "assertPlatformSendAuthorized" | "onPlatformSendDispatch" | "silent">;
++
++export type TelegramDiceSendResult = TelegramSendResult & {
++  emoji: TelegramDiceEmoji;
++  /** Server-rolled outcome. Telegram picks it; it cannot be requested. */
++  value?: number;
++};
++
++const TELEGRAM_DICE_EMOJI_SET: ReadonlySet<string> = new Set(TELEGRAM_DICE_EMOJI);
++
++// Keyboards and models routinely append the emoji presentation selector (⚽️ vs ⚽), which
++// Telegram does not accept for sendDice. Strip it before the allowlist lookup, the same way
++// the reaction path does, so a legitimate face is not rejected locally.
++function normalizeTelegramDiceEmoji(value: string | undefined): string {
++  return (value ?? "").trim().replace(/[\uFE0E\uFE0F]/gu, "") || "🎲";
++}
++
++function isTelegramDiceEmoji(value: string): value is TelegramDiceEmoji {
++  return TELEGRAM_DICE_EMOJI_SET.has(value);
++}
++
++/**
++ * Send an animated dice/dart/basketball/football/bowling/slot roll.
++ * The outcome is chosen by Telegram and returned in the sent message, so the
++ * caller learns the value immediately even though it cannot influence it.
++ * @param to - Chat ID or username (e.g., "123456789" or "@username")
++ * @param emoji - One of TELEGRAM_DICE_EMOJI; defaults to 🎲
++ * @param opts - Optional configuration
++ */
++export async function sendDiceTelegram(
++  to: string,
++  emoji: string | undefined,
++  opts: TelegramDiceOpts,
++): Promise<TelegramDiceSendResult> {
++  const normalized = normalizeTelegramDiceEmoji(emoji);
++  if (!isTelegramDiceEmoji(normalized)) {
++    throw new Error(
++      `Unsupported Telegram dice emoji "${normalized}". Use one of: ${TELEGRAM_DICE_EMOJI.join(" ")}`,
++    );
++  }
++
++  return withTelegramApiContext(opts, async (context): Promise<TelegramDiceSendResult> =>
++    sendDiceTelegramWithContext(to, normalized, opts, context),
++  );
++}
++
++async function sendDiceTelegramWithContext(
++  to: string,
++  emoji: TelegramDiceEmoji,
++  opts: TelegramDiceOpts,
++  context: TelegramApiContext,
++): Promise<TelegramDiceSendResult> {
++  const { api } = context;
++  const prepared = await prepareTelegramOutbound({
++    to,
++    context,
++    opts,
++    thread: {
++      messageThreadId: opts.messageThreadId,
++      replyToMessageId: opts.replyToMessageId,
++    },
++    request: { kind: "nonIdempotent", useApiErrorLogging: false },
++  });
++  const diceParams = {
++    ...prepared.threadParams,
++    ...(opts.silent ? { disable_notification: true } : {}),
++  };
++
++  const result = await prepared.request(
++    () =>
++      api.sendDice(
++        prepared.chatId,
++        emoji,
++        Object.keys(diceParams).length > 0 ? diceParams : undefined,
++      ),
++    "dice",
++  );
++  const finalized = await finalizeTelegramOutbound({
++    context,
++    prepared,
++    result,
++    resultContext: "dice send",
++  });
++  const value = typeof result?.dice?.value === "number" ? result.dice.value : undefined;
++  return { ...finalized, emoji, value };
++}
++
+ /**
+  * Send a poll to a Telegram chat.
+  * @param to - Chat ID or username (e.g., "123456789" or "@username")
+diff --git a/extensions/telegram/src/send.ts b/extensions/telegram/src/send.ts
+index 4d321c3ec37..76b4a03267d 100644
+--- a/extensions/telegram/src/send.ts
++++ b/extensions/telegram/src/send.ts
+@@ -19,4 +19,4 @@ export {
+ export { editMessageReplyMarkupTelegram, editMessageTelegram } from "./send-edit.js";
+ export { sendLocationTelegram } from "./send-location.js";
+ export { sendMessageTelegram } from "./send-message.js";
+-export { sendPollTelegram, sendStickerTelegram } from "./send-special.js";
++export { sendDiceTelegram, sendPollTelegram, sendStickerTelegram } from "./send-special.js";
+diff --git a/src/agents/embedded-agent-message-tool-source-reply.test.ts b/src/agents/embedded-agent-message-tool-source-reply.test.ts
+index 4b22c602347..9d58bfb60f9 100644
+--- a/src/agents/embedded-agent-message-tool-source-reply.test.ts
++++ b/src/agents/embedded-agent-message-tool-source-reply.test.ts
+@@ -386,6 +386,35 @@ describe("isDeliveredMessageToolOnlySourceReplyResult", () => {
+     ).toBe(true);
+   });
+ 
++  it("accepts a confirmed native send the reply-action name list does not enumerate", () => {
++    // The producer already proved the roll reached this run's conversation; without
++    // trusting that fact the run sends a redundant text reply after the visible send.
++    expect(
++      isDeliveredMessageToolOnlySourceReplyResult({
++        sourceReplyDeliveryMode: "message_tool_only",
++        toolName: "message",
++        args: { action: "dice", to: "direct:user-1", diceEmoji: "\u{1F3B2}" },
++        result: {
++          details: {
++            ok: true,
++            sourceReplyRoute: "current-source",
++          },
++        },
++      }),
++    ).toBe(true);
++  });
++
++  it("rejects an unconfirmed native send outside the reply-action name list", () => {
++    expect(
++      isDeliveredMessageToolOnlySourceReplyResult({
++        sourceReplyDeliveryMode: "message_tool_only",
++        toolName: "message",
++        args: { action: "dice", to: "direct:someone-else", diceEmoji: "\u{1F3B2}" },
++        result: { details: { ok: true } },
++      }),
++    ).toBe(false);
++  });
++
+   it("rejects an unconfirmed thread reply outside message-tool-only mode", () => {
+     expect(
+       isDeliveredMessageToolOnlySourceReplyResult({
+diff --git a/src/agents/embedded-agent-message-tool-source-reply.ts b/src/agents/embedded-agent-message-tool-source-reply.ts
+index 8d0e87a5e52..dcff7a597f9 100644
+--- a/src/agents/embedded-agent-message-tool-source-reply.ts
++++ b/src/agents/embedded-agent-message-tool-source-reply.ts
+@@ -126,9 +126,12 @@ export function isDeliveredMessageToolOnlySourceReplyResult(params: {
+     return false;
+   }
+   const args = asOptionalRecord(params.args) ?? {};
++  // A recorded `current-source` route is the producer's own delivery fact: it already
++  // proved this send reached the run's conversation. Re-deriving eligibility from the
++  // action name here silently drops native sends the name list does not enumerate.
+   const sourceRouteReplyAction =
+-    (params.allowExplicitSourceRoute === true || confirmedCurrentSourceRoute) &&
+-    isMessageToolSourceReplyActionName(args.action);
++    confirmedCurrentSourceRoute ||
++    (params.allowExplicitSourceRoute === true && isMessageToolSourceReplyActionName(args.action));
+   if (!isMessageToolSendActionName(args.action) && !sourceRouteReplyAction) {
+     return false;
+   }
+diff --git a/src/agents/tools/message-tool-schema-scoping.ts b/src/agents/tools/message-tool-schema-scoping.ts
+index 9b93437df66..4de2c82ec23 100644
+--- a/src/agents/tools/message-tool-schema-scoping.ts
++++ b/src/agents/tools/message-tool-schema-scoping.ts
+@@ -19,6 +19,7 @@ type SchemaGroup =
+   | "poll"
+   | "channelTarget"
+   | "sticker"
++  | "dice"
+   | "thread"
+   | "event"
+   | "moderation"
+@@ -153,6 +154,7 @@ const SCOPED_ACTION_GROUPS: ReadonlyArray<{
+     ],
+   },
+   { group: "presence", actions: ["set-presence", "set-profile", "voice-status"] },
++  { group: "dice", actions: ["dice"] },
+ ];
+ 
+ function isSendOnly(actions: readonly string[]): boolean {
+diff --git a/src/agents/tools/message-tool-schema.dice.test.ts b/src/agents/tools/message-tool-schema.dice.test.ts
+new file mode 100644
+index 00000000000..2ee5f844678
+--- /dev/null
++++ b/src/agents/tools/message-tool-schema.dice.test.ts
+@@ -0,0 +1,46 @@
++// Scoped tool schemas prune parameters the selected actions do not use, and merge the
++// surviving groups into one flat object. Without a group of its own `dice` advertised no
++// face at all; sharing the reaction group's `emoji` key would have retitled that parameter
++// for `react` whenever both actions are enabled.
++import { describe, expect, it } from "vitest";
++import { buildMessageToolSchemaFromActions } from "./message-tool-schema-scoping.js";
++import { MESSAGE_TOOL_SCHEMA_BUILDERS } from "./message-tool-schema.js";
++
++const OPTIONS = {
++  includeDeliveryPin: false,
++  includeBestEffort: false,
++  scopeToActions: true,
++} as const;
++
++function schemaPropertiesFor(actions: readonly string[]) {
++  const schema = buildMessageToolSchemaFromActions(
++    actions,
++    OPTIONS as never,
++    MESSAGE_TOOL_SCHEMA_BUILDERS,
++  );
++  return (schema as { properties?: Record<string, { description?: string }> }).properties ?? {};
++}
++
++function propertiesFor(actions: readonly string[]) {
++  return Object.keys(schemaPropertiesFor(actions));
++}
++
++describe("dice schema scoping", () => {
++  it("advertises the dice face when dice is in scope", () => {
++    expect(propertiesFor(["dice"])).toContain("diceEmoji");
++  });
++
++  it("does not drag reaction-only parameters into a dice-only schema", () => {
++    const properties = propertiesFor(["dice"]);
++    expect(properties).not.toContain("remove");
++    expect(properties).not.toContain("trackToolCalls");
++  });
++
++  it("leaves the reaction emoji description intact when both actions are enabled", () => {
++    const properties = schemaPropertiesFor(["react", "dice"]);
++    expect(properties.emoji?.description).toBe(
++      "Unicode emoji; channels may also support custom emoji.",
++    );
++    expect(properties.diceEmoji?.description).toContain("Dice face");
++  });
++});
+diff --git a/src/agents/tools/message-tool-schema.ts b/src/agents/tools/message-tool-schema.ts
+index 1a7871e1b26..ece4f1d3b1a 100644
+--- a/src/agents/tools/message-tool-schema.ts
++++ b/src/agents/tools/message-tool-schema.ts
+@@ -244,6 +244,20 @@ function buildSendSchema(options: {
+   return props;
+ }
+ 
++// Scoped groups merge into one flat object, so a key contributed by two groups keeps only
++// the last description. `emoji` belongs to reactions; dice carries its own key instead, or
++// enabling dice would silently retitle the reaction parameter wherever both are in scope.
++function buildDiceSchema() {
++  return {
++    diceEmoji: Type.Optional(
++      Type.String({
++        description:
++          "Dice face: 🎲 🎯 🏀 ⚽ 🎳 🎰 (default 🎲). The platform rolls the outcome and returns it; it cannot be requested.",
++      }),
++    ),
++  };
++}
++
+ function buildReactionSchema() {
+   return {
+     messageId: Type.Optional(
+@@ -482,6 +496,7 @@ function buildMessageToolSchemaProps(options: {
+     ...buildPollSchema(),
+     ...buildChannelTargetSchema(),
+     ...buildStickerSchema(),
++    ...buildDiceSchema(),
+     ...buildThreadSchema(),
+     ...buildEventSchema(),
+     ...buildModerationSchema(),
+@@ -506,6 +521,7 @@ export const MESSAGE_TOOL_SCHEMA_BUILDERS = {
+     poll: buildPollSchema,
+     channelTarget: buildChannelTargetSchema,
+     sticker: buildStickerSchema,
++    dice: buildDiceSchema,
+     thread: buildThreadSchema,
+     event: buildEventSchema,
+     moderation: buildModerationSchema,
+diff --git a/src/channels/plugins/message-action-dispatch.ts b/src/channels/plugins/message-action-dispatch.ts
+index 071b9c73d7c..1c696fe7311 100644
+--- a/src/channels/plugins/message-action-dispatch.ts
++++ b/src/channels/plugins/message-action-dispatch.ts
+@@ -82,6 +82,8 @@ const CHANNEL_MESSAGE_ACTION_READ_POLICIES = {
+   search: CONVERSATION_READ,
+   sticker: NO_CONVERSATION_READ,
+   "sticker-search": BUNDLED_CURRENT_CONTEXT_CACHE_READ,
++  // A dice roll is an outbound send to an explicit target; it reads no conversation.
++  dice: NO_CONVERSATION_READ,
+   "member-info": CONVERSATION_READ,
+   "role-info": CONVERSATION_READ,
+   "emoji-list": CONVERSATION_READ,
+diff --git a/src/channels/plugins/message-action-names.ts b/src/channels/plugins/message-action-names.ts
+index 639759e04f3..bd526744a72 100644
+--- a/src/channels/plugins/message-action-names.ts
++++ b/src/channels/plugins/message-action-names.ts
+@@ -31,6 +31,7 @@ export const CHANNEL_MESSAGE_ACTION_NAMES = [
+   "search",
+   "sticker",
+   "sticker-search",
++  "dice",
+   "member-info",
+   "role-info",
+   "emoji-list",
+diff --git a/src/infra/outbound/message-action-execution.reply-action.test.ts b/src/infra/outbound/message-action-execution.reply-action.test.ts
+index 72ac27d96a3..974c96af8d8 100644
+--- a/src/infra/outbound/message-action-execution.reply-action.test.ts
++++ b/src/infra/outbound/message-action-execution.reply-action.test.ts
+@@ -1,10 +1,12 @@
+ // Covers reply-type plugin actions: outbound text hygiene (citation control
+-// markers) and current-source delivery marking for implicit reply routes.
++// markers) and current-source delivery marking for implicit reply routes and
++// for targeted native sends that deliver visible content of their own.
+ import { afterEach, describe, expect, it } from "vitest";
+ import { setActivePluginRegistry } from "../../plugins/runtime.js";
+ import { createTestRegistry } from "../../test-utils/channel-plugins.js";
+ import {
+   registerReplyPlugin,
++  runCurrentConversationDiceAction as runDiceAction,
+   runCurrentConversationPollAction as runPollAction,
+   runReplyAction,
+ } from "./message-action-runner.test-support.js";
+@@ -80,4 +82,21 @@ describe("runMessageAction reply-type plugin actions", () => {
+ 
+     expect((result.payload as { sourceReplyRoute?: unknown }).sourceReplyRoute).toBeUndefined();
+   });
++
++  it("marks targeted visible sends to the current conversation as current-source deliveries", async () => {
++    registerReplyPlugin();
++
++    const result = await runDiceAction({ to: "direct:user-1" });
++
++    expect(result.kind).toBe("action");
++    expect(result.payload).toMatchObject({ sourceReplyRoute: "current-source" });
++  });
++
++  it("leaves targeted visible sends to other conversations unmarked", async () => {
++    registerReplyPlugin();
++
++    const result = await runDiceAction({ to: "direct:someone-else" });
++
++    expect((result.payload as { sourceReplyRoute?: unknown }).sourceReplyRoute).toBeUndefined();
++  });
+ });
+diff --git a/src/infra/outbound/message-action-runner.test-support.ts b/src/infra/outbound/message-action-runner.test-support.ts
+index 5a1476d2a47..349b0c60832 100644
+--- a/src/infra/outbound/message-action-runner.test-support.ts
++++ b/src/infra/outbound/message-action-runner.test-support.ts
+@@ -317,8 +317,8 @@ function createReplyActionPlugin(handleAction: ChannelActionHandler): ChannelPlu
+       },
+     },
+     actions: {
+-      describeMessageTool: () => ({ actions: ["reply", "poll"] }),
+-      supportsAction: ({ action }) => action === "reply" || action === "poll",
++      describeMessageTool: () => ({ actions: ["reply", "poll", "dice"] }),
++      supportsAction: ({ action }) => action === "reply" || action === "poll" || action === "dice",
+       handleAction,
+     },
+   };
+@@ -390,6 +390,28 @@ export async function runCurrentConversationPollAction(params: { to: string }) {
+   });
+ }
+ 
++export async function runCurrentConversationDiceAction(params: { to: string }) {
++  const toolContext = {
++    currentChannelProvider: "testchat" as const,
++    currentChannelId: "direct:user-1",
++    currentMessageId: "1783",
++  };
++  return await runFixtureMessageAction({
++    cfg: testchatConfig,
++    action: "dice",
++    params: { channel: "testchat", to: params.to, diceEmoji: "\u{1F3B2}" },
++    toolContext,
++    messageActionAuthorization: {
++      requesterAccountId: "default",
++      toolContext,
++    },
++    sessionKey: "agent:main:testchat:direct:user-1",
++    defaultAccountId: "default",
++    sourceReplyDeliveryMode: "message_tool_only",
++    dryRun: false,
++  });
++}
++
+ /** Returns a bootstrap registry mock for message-action alias tests. */
+ export function createPinboardMessageActionBootstrapRegistryMock() {
+   const resolveIMessageTarget = ({ args }: { args: Record<string, unknown> }) => {
+diff --git a/src/infra/outbound/message-action-spec.test.ts b/src/infra/outbound/message-action-spec.test.ts
+index a7315050b62..5b7de4a75aa 100644
+--- a/src/infra/outbound/message-action-spec.test.ts
++++ b/src/infra/outbound/message-action-spec.test.ts
+@@ -5,6 +5,7 @@ import {
+   actionHasResourceReference,
+   actionHasTarget,
+   actionRequiresTarget,
++  MESSAGE_ACTION_TARGET_MODE,
+ } from "./message-action-spec.js";
+ 
+ vi.mock("../../channels/plugins/bootstrap-registry.js", async () => ({
+@@ -139,3 +140,10 @@ describe("actionHasResourceReference", () => {
+     expect(actionHasResourceReference(action, params, { channel })).toBe(expected);
+   });
+ });
++
++describe("MESSAGE_ACTION_TARGET_MODE coverage", () => {
++  it("routes dice to the `to` field like other outbound sends", () => {
++    expect(MESSAGE_ACTION_TARGET_MODE.dice).toBe("to");
++    expect(actionRequiresTarget("dice")).toBe(true);
++  });
++});
+diff --git a/src/infra/outbound/message-action-spec.ts b/src/infra/outbound/message-action-spec.ts
+index bebb18a0d14..041bca38b14 100644
+--- a/src/infra/outbound/message-action-spec.ts
++++ b/src/infra/outbound/message-action-spec.ts
+@@ -49,6 +49,7 @@ export const MESSAGE_ACTION_TARGET_MODE: Record<ChannelMessageActionName, Messag
+     "thread-reply": "to",
+     search: "none",
+     sticker: "to",
++    dice: "to",
+     "sticker-search": "none",
+     "member-info": "none",
+     "role-info": "none",
+diff --git a/src/infra/outbound/outbound-policy.test.ts b/src/infra/outbound/outbound-policy.test.ts
+index 9b19c4763e4..3f404a03423 100644
+--- a/src/infra/outbound/outbound-policy.test.ts
++++ b/src/infra/outbound/outbound-policy.test.ts
+@@ -198,6 +198,22 @@ describe("outbound policy helpers", () => {
+       currentChannelProvider: "workspace",
+       expected: /target="C999" while bound to "C123"/,
+     },
++    {
++      // A roll is recipient-visible and addressed by `to`; omitting it from the guard set
++      // let a bound run drop out of the check before targets were ever compared.
++      cfg: {
++        ...workspaceConfig,
++        tools: {
++          message: { crossContext: { allowWithinProvider: false } },
++        },
++      } as OpenClawConfig,
++      channel: "workspace",
++      action: "dice" as const,
++      to: "C999",
++      currentChannelId: "C123",
++      currentChannelProvider: "workspace",
++      expected: /target="C999" while bound to "C123"/,
++    },
+     {
+       cfg: {
+         ...workspaceConfig,
+diff --git a/src/infra/outbound/outbound-policy.ts b/src/infra/outbound/outbound-policy.ts
+index d05841df627..4c2c711d4b1 100644
+--- a/src/infra/outbound/outbound-policy.ts
++++ b/src/infra/outbound/outbound-policy.ts
+@@ -44,6 +44,9 @@ const CONTEXT_GUARDED_ACTIONS = new Set<ChannelMessageActionName>([
+   "thread-create",
+   "thread-reply",
+   "sticker",
++  // A roll is a recipient-visible send addressed by `to`, so it must clear the same
++  // cross-context check; without the entry the guard returns before comparing targets.
++  "dice",
+ ]);
+ 
+ // Mutations are guarded above, but markers only apply to outbound payloads that
+diff --git a/src/infra/outbound/source-reply-mirror.test.ts b/src/infra/outbound/source-reply-mirror.test.ts
+index 605c73d3f5b..cfeede4c840 100644
+--- a/src/infra/outbound/source-reply-mirror.test.ts
++++ b/src/infra/outbound/source-reply-mirror.test.ts
+@@ -237,6 +237,62 @@ describe("mirrorDeliveredSourceReplyToTranscript", () => {
+     expect(mirrored).toBe(false);
+     expect(transcriptMocks.append).not.toHaveBeenCalled();
+   });
++
++  // The message tool's argument object is flat, so a roll can carry send-payload fields.
++  // Telegram ignores them, so mirroring would record assistant text nobody received.
++  it("does not mirror a dice delivery carrying ignored send-payload text", async () => {
++    const mirrored = await mirrorDeliveredSourceReplyToTranscript({
++      action: "dice",
++      channel: "testchat",
++      actionParams: { to: "direct:user-1", message: "You rolled a six" },
++      cfg: {},
++      sessionKey: "agent:main:testchat:direct:user-1",
++      toolContext: {
++        currentChannelProvider: "testchat",
++        currentChannelId: "direct:user-1",
++      },
++      deliveredPayload: { ok: true, messageId: "dice-1" },
++    });
++
++    expect(mirrored).toBe(false);
++    expect(transcriptMocks.append).not.toHaveBeenCalled();
++  });
++
++  it("does not mirror a dice delivery carrying ignored media fields", async () => {
++    const mirrored = await mirrorDeliveredSourceReplyToTranscript({
++      action: "dice",
++      channel: "testchat",
++      actionParams: { to: "direct:user-1", mediaUrl: "https://example.invalid/roll.png" },
++      cfg: {},
++      sessionKey: "agent:main:testchat:direct:user-1",
++      toolContext: {
++        currentChannelProvider: "testchat",
++        currentChannelId: "direct:user-1",
++      },
++      deliveredPayload: { ok: true, messageId: "dice-2" },
++    });
++
++    expect(mirrored).toBe(false);
++    expect(transcriptMocks.append).not.toHaveBeenCalled();
++  });
++
++  it("does not mirror a poll delivery carrying ignored send-payload text", async () => {
++    const mirrored = await mirrorDeliveredSourceReplyToTranscript({
++      action: "poll",
++      channel: "testchat",
++      actionParams: { to: "direct:user-1", message: "ignored poll caption" },
++      cfg: {},
++      sessionKey: "agent:main:testchat:direct:user-1",
++      toolContext: {
++        currentChannelProvider: "testchat",
++        currentChannelId: "direct:user-1",
++      },
++      deliveredPayload: { ok: true, messageId: "poll-1" },
++    });
++
++    expect(mirrored).toBe(false);
++    expect(transcriptMocks.append).not.toHaveBeenCalled();
++  });
+ });
+ 
+ describe("beginTerminalSourceReplyDelivery", () => {
+diff --git a/src/infra/outbound/source-reply-mirror.ts b/src/infra/outbound/source-reply-mirror.ts
+index 460937c97bd..b377a4facb6 100644
+--- a/src/infra/outbound/source-reply-mirror.ts
++++ b/src/infra/outbound/source-reply-mirror.ts
+@@ -392,12 +392,33 @@ function matchesCurrentSourceTarget(
+   );
+ }
+ 
++/**
++ * Actions that address their conversation by target, so an exact target match is what proves
++ * the delivery reached the current source. Reply-type actions resolve their conversation from
++ * a message id instead and are decided separately in isDeliveredCurrentSourceReply.
++ */
++const TARGET_ADDRESSED_ACTION_NAMES: ReadonlySet<string> = new Set<ChannelMessageActionName>([
++  "dice",
++  "poll",
++  "send",
++]);
++
++/**
++ * Actions whose `actionParams` text and media are the payload the channel actually delivers.
++ * The message tool's argument object is flat, so a roll or a poll can carry `message` or media
++ * fields the channel ignores; mirroring those would write text into the transcript that no
++ * recipient ever saw. Delivery classification above stays separate and keeps covering them.
++ */
++const MIRRORABLE_SOURCE_ACTION_NAMES: ReadonlySet<string> = new Set<ChannelMessageActionName>([
++  "send",
++]);
++
+ function isCurrentSourceConversation(
+   params: SourceReplyTranscriptMirrorParams,
+ ): params is MirrorableSourceReplyTranscriptParams {
+-  // Polls share the send target contract. Transcript mirroring stays send-only
+-  // because poll params carry no message text to mirror.
+-  if (params.action !== "send" && params.action !== "poll") {
++  // Transcript mirroring shares this predicate; actions carrying no text or media drop out
++  // on the empty-payload check there rather than needing a second action list here.
++  if (!TARGET_ADDRESSED_ACTION_NAMES.has(params.action.trim().toLowerCase())) {
+     return false;
+   }
+   if (!hasCurrentSourceContext(params)) {
+@@ -473,10 +494,7 @@ export function isDeliveredCurrentSourceReply(params: SourceReplyTranscriptMirro
+     case "thread-reply":
+       return isDeliveredThreadPlacementSourceReply(params);
+     default:
+-      return (
+-        (params.action === "send" || params.action === "poll") &&
+-        isExactCurrentSourceConversation(params)
+-      );
++      return isExactCurrentSourceConversation(params);
+   }
+ }
+ 
+@@ -534,6 +552,9 @@ export async function mirrorDeliveredSourceReplyToTranscript(
+     params,
+     resolveChannelThreadAddressing(params.channel),
+   );
++  if (!MIRRORABLE_SOURCE_ACTION_NAMES.has(params.action.trim().toLowerCase())) {
++    return false;
++  }
+   if (!isCurrentSourceConversation(params)) {
+     return false;
+   }
+-- 
+2.55.0
+

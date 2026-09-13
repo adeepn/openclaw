@@ -1,0 +1,400 @@
+From 80d751b16ccbc74b0fa317d9739a7d93c5d80140 Mon Sep 17 00:00:00 2001
+From: Viacheslav Bocharov <v@baodeep.com>
+Date: Sun, 13 Sep 2026 15:14:05 +0300
+Subject: [PATCH 1/2] fix(telegram): deliver inbound dice rolls to the agent
+
+A dice message carries neither text nor a downloadable file, so it
+normalized to an empty body and was dropped before reaching the agent.
+Rolls made in a chat were invisible to it: no message, no note, no error.
+
+Extract dice during inbound normalization the same way locations are
+handled, and fold the result into the message body as a one-line marker.
+Attribution stays out of the marker: the envelope already prefixes group
+bodies with the sender label, and the inbound debounce buffer keys on
+sender id, so a marker cannot surface under another user name.
+
+The message cache and the reply-target projection derive their own bodies
+from text, rich content, media, and location, so a reply to a roll reached
+the agent without the roll. Move the shared shape into one producer:
+resolveTelegramNonTextBody returns the body for messages carrying neither
+text nor a downloadable file, and reports whether it is a location, which
+counts as user text downstream and is forwarded structurally, or a dice
+roll, which is neither. All three producers now use it.
+
+hasUserText stays as it was. Its only consumer is the audio preflight, and
+a Bot API message carries either dice or voice/audio, never both.
+
+Upstream: https://github.com/openclaw/openclaw/pull/137112
+---
+ .../src/bot-message-context.body.test.ts      | 25 ++++++++
+ .../telegram/src/bot-message-context.body.ts  | 15 ++---
+ .../src/bot/body-helpers.dice.test.ts         | 53 +++++++++++++++++
+ extensions/telegram/src/bot/body-helpers.ts   | 58 ++++++++++++++++++-
+ extensions/telegram/src/bot/helpers.test.ts   | 21 +++++++
+ extensions/telegram/src/bot/helpers.ts        |  7 +--
+ extensions/telegram/src/message-cache.test.ts | 24 ++++++++
+ extensions/telegram/src/message-cache.ts      |  9 ++-
+ 8 files changed, 192 insertions(+), 20 deletions(-)
+ create mode 100644 extensions/telegram/src/bot/body-helpers.dice.test.ts
+
+diff --git a/extensions/telegram/src/bot-message-context.body.test.ts b/extensions/telegram/src/bot-message-context.body.test.ts
+index 20b868cb5a9..640e7c1851b 100644
+--- a/extensions/telegram/src/bot-message-context.body.test.ts
++++ b/extensions/telegram/src/bot-message-context.body.test.ts
+@@ -248,6 +248,31 @@ describe("resolveTelegramInboundBody", () => {
+     },
+   );
+ 
++  privateBodyTest(
++    "delivers a dice-only update instead of dropping it as an empty body",
++    { dice: { emoji: "🎲", value: 4 } },
++    (result) => {
++      expect(result?.rawBody).toBe("[Dice 🎲 = 4]");
++      expect(result?.bodyText).toBe("[Dice 🎲 = 4]");
++    },
++  );
++
++  it("keeps a mention-skipped dice roll in group history", async () => {
++    const logger = createLogger();
++    const groupHistories: BodyParams["groupHistories"] = new Map();
++    const result = await resolveGroup({
++      logger,
++      message: { dice: { emoji: "🎯", value: 3 } },
++      overrides: { groupHistories, historyLimit: 10 },
++    });
++
++    expect(logger.info).toHaveBeenCalledWith(SKIPPED_GROUP, "skipping group message");
++    expect(result).toBeNull();
++    expect([...groupHistories.values()].flat().map((entry) => entry.body)).toEqual([
++      "[Dice 🎯 = 3]",
++    ]);
++  });
++
+   privateBodyTest(
+     "delivers rich-message-only updates as a sanitized placeholder",
+     richMessage({ blocks: [{ type: "paragraph" }] }),
+diff --git a/extensions/telegram/src/bot-message-context.body.ts b/extensions/telegram/src/bot-message-context.body.ts
+index d5f6662c774..bdb8b451628 100644
+--- a/extensions/telegram/src/bot-message-context.body.ts
++++ b/extensions/telegram/src/bot-message-context.body.ts
+@@ -3,7 +3,6 @@ import {
+   buildMentionRegexes,
+   classifyChannelInboundEvent,
+   formatMediaPlaceholderText,
+-  formatLocationText,
+   implicitMentionKindWhen,
+   logInboundDrop,
+   matchesMentionWithExplicit,
+@@ -43,8 +42,8 @@ import type {
+ import {
+   buildSenderLabel,
+   buildSenderName,
+-  extractTelegramLocation,
+   getTelegramTextParts,
++  resolveTelegramNonTextBody,
+   hasLeadingBotCommandAddressedToOtherBot,
+   hasBotMentionInText,
+   hasBotMention,
+@@ -248,15 +247,17 @@ export async function resolveTelegramInboundBody(params: {
+     formattedStickerDescription = `[Sticker${stickerContext ? ` ${stickerContext}` : ""}] ${cachedStickerDescription}`;
+   }
+ 
+-  const locationData = extractTelegramLocation(msg);
+-  const locationText = locationData ? formatLocationText(locationData) : undefined;
++  const nonTextBody = resolveTelegramNonTextBody(msg);
+   const rawText = renderTelegramTextEntities(
+     messageTextParts.text,
+     messageTextParts.entities,
+   ).trim();
+   const richText = resolveTelegramRichMessageText(msg);
+-  const hasUserText = Boolean(rawText || locationText);
+-  let rawBody = [rawText, locationText].filter(Boolean).join("\n").trim();
++  // Dice stays out of this flag on purpose: its only consumer is the audio preflight
++  // below, and a Bot API message carries either `dice` or `voice`/`audio`, never both,
++  // so adding it here could not change any decision.
++  const hasUserText = Boolean(rawText || nonTextBody?.kind === "location");
++  let rawBody = [rawText, nonTextBody?.text].filter(Boolean).join("\n").trim();
+   if (!rawBody) {
+     rawBody = richText ?? resolveTelegramRichMessagePlaceholder(msg) ?? "";
+   }
+@@ -466,6 +467,6 @@ export async function resolveTelegramInboundBody(params: {
+       ? { audioTranscribedMediaIndex }
+       : {}),
+     stickerCacheHit,
+-    locationData: locationData ?? undefined,
++    locationData: nonTextBody?.kind === "location" ? nonTextBody.location : undefined,
+   };
+ }
+diff --git a/extensions/telegram/src/bot/body-helpers.dice.test.ts b/extensions/telegram/src/bot/body-helpers.dice.test.ts
+new file mode 100644
+index 00000000000..2712e975f08
+--- /dev/null
++++ b/extensions/telegram/src/bot/body-helpers.dice.test.ts
+@@ -0,0 +1,53 @@
++// Telegram tests cover the canonical body producer for messages that carry no text.
++import type { Message } from "grammy/types";
++import { describe, expect, it } from "vitest";
++import { resolveTelegramNonTextBody } from "./body-helpers.js";
++
++function diceMessage(dice: unknown): Message {
++  return { dice } as Message;
++}
++
++describe("resolveTelegramNonTextBody", () => {
++  it("renders a dice roll as a one-line marker", () => {
++    expect(resolveTelegramNonTextBody(diceMessage({ emoji: "\u{1F3B2}", value: 4 }))).toEqual({
++      kind: "dice",
++      text: "[Dice \u{1F3B2} = 4]",
++    });
++  });
++
++  it("covers the wider slot-machine range", () => {
++    expect(resolveTelegramNonTextBody(diceMessage({ emoji: "\u{1F3B0}", value: 64 }))).toEqual({
++      kind: "dice",
++      text: "[Dice \u{1F3B0} = 64]",
++    });
++  });
++
++  it("keeps a zero value rather than treating it as absent", () => {
++    expect(resolveTelegramNonTextBody(diceMessage({ emoji: "\u{1F3AF}", value: 0 }))).toEqual({
++      kind: "dice",
++      text: "[Dice \u{1F3AF} = 0]",
++    });
++  });
++
++  it("ignores a dice payload without a usable value", () => {
++    expect(resolveTelegramNonTextBody(diceMessage({ emoji: "\u{1F3B2}" }))).toBeUndefined();
++    expect(
++      resolveTelegramNonTextBody(diceMessage({ emoji: "\u{1F3B2}", value: Number.NaN })),
++    ).toBeUndefined();
++  });
++
++  it("ignores a dice payload without an emoji", () => {
++    expect(resolveTelegramNonTextBody(diceMessage({ emoji: "   ", value: 3 }))).toBeUndefined();
++  });
++
++  it("returns nothing when the message carries neither location nor dice", () => {
++    expect(resolveTelegramNonTextBody(diceMessage(undefined))).toBeUndefined();
++  });
++
++  it("reports a location separately, since only location counts as user text", () => {
++    const located = {
++      location: { latitude: 48.858844, longitude: 2.294351 },
++    } as Message;
++    expect(resolveTelegramNonTextBody(located)?.kind).toBe("location");
++  });
++});
+diff --git a/extensions/telegram/src/bot/body-helpers.ts b/extensions/telegram/src/bot/body-helpers.ts
+index cd71b30cb2f..cebefcf7ae2 100644
+--- a/extensions/telegram/src/bot/body-helpers.ts
++++ b/extensions/telegram/src/bot/body-helpers.ts
+@@ -9,9 +9,10 @@ import type {
+   RichText,
+   User,
+ } from "grammy/types";
+-import type {
+-  ChannelInboundMediaInput,
+-  NormalizedLocation,
++import {
++  type ChannelInboundMediaInput,
++  formatLocationText,
++  type NormalizedLocation,
+ } from "openclaw/plugin-sdk/channel-inbound";
+ import {
+   normalizeLowercaseStringOrEmpty,
+@@ -535,6 +536,57 @@ export function normalizeForwardedContext(msg: Message): TelegramForwardedContex
+   return resolveForwardOrigin(msg.forward_origin);
+ }
+ 
++type TelegramDiceRoll = {
++  emoji: string;
++  value: number;
++};
++
++/**
++ * Telegram dice rolls carry no text and no downloadable file, so they are
++ * neither text nor media. Extract them explicitly, the same way locations are
++ * handled, otherwise the message normalizes to an empty body and is dropped.
++ */
++function extractTelegramDice(msg: Pick<Message, "dice">): TelegramDiceRoll | null {
++  const dice = msg.dice;
++  if (!dice || typeof dice.value !== "number" || !Number.isFinite(dice.value)) {
++    return null;
++  }
++  const emoji = normalizeOptionalString(dice.emoji);
++  if (!emoji) {
++    return null;
++  }
++  return { emoji, value: dice.value };
++}
++
++/**
++ * Attribution stays out of the marker: the envelope already prefixes group bodies with the
++ * sender label, and the inbound debounce buffer keys on sender id, so a marker can never
++ * end up under someone else's name.
++ */
++function formatTelegramDiceText(dice: TelegramDiceRoll): string {
++  return `[Dice ${dice.emoji} = ${dice.value}]`;
++}
++
++/** Location counts as user text downstream and is forwarded structurally; dice is neither. */
++export type TelegramNonTextBody =
++  | { kind: "location"; text: string; location: NormalizedLocation }
++  | { kind: "dice"; text: string };
++
++/**
++ * Bodies for messages that carry neither text nor a downloadable file. Inbound
++ * normalization, the message cache, and reply-target projection all need this; each grew
++ * its own copy, which is how dice reached only the first of them and a reply to a roll
++ * arrived without it.
++ */
++export function resolveTelegramNonTextBody(msg: Message): TelegramNonTextBody | undefined {
++  const location = extractTelegramLocation(msg);
++  if (location) {
++    return { kind: "location", text: formatLocationText(location), location };
++  }
++  const dice = extractTelegramDice(msg);
++  return dice ? { kind: "dice", text: formatTelegramDiceText(dice) } : undefined;
++}
++
+ export function extractTelegramLocation(msg: Message): NormalizedLocation | null {
+   const { venue, location } = msg;
+ 
+diff --git a/extensions/telegram/src/bot/helpers.test.ts b/extensions/telegram/src/bot/helpers.test.ts
+index f862a6bb631..77213cd7569 100644
+--- a/extensions/telegram/src/bot/helpers.test.ts
++++ b/extensions/telegram/src/bot/helpers.test.ts
+@@ -380,6 +380,27 @@ describe("describeReplyTarget", () => {
+     expect(result?.source).toBe("reply_to_message");
+   });
+ 
++  it("describes a replied-to dice roll when the cache did not supply a body", () => {
++    // A dice roll has neither text nor media, so before it was normalized here the whole
++    // target resolved to null and a reply to the roll reached the agent without it.
++    const result = describeReplyTarget(
++      asMalformedTelegramMessage({
++        message_id: 2,
++        date: 1000,
++        chat: { id: 1, type: "private" },
++        reply_to_message: {
++          message_id: 1,
++          date: 900,
++          chat: { id: 1, type: "private" },
++          from: { id: 42, first_name: "Alice", is_bot: false },
++          dice: { emoji: "\u{1F3AF}", value: 3 },
++        },
++      }),
++    );
++    expect(result?.body).toBe("[Dice \u{1F3AF} = 3]");
++    expect(result?.sender).toBe("Alice");
++  });
++
+   it("handles non-string reply text gracefully (issue #27201)", () => {
+     const result = describeReplyTarget(
+       asMalformedTelegramMessage({
+diff --git a/extensions/telegram/src/bot/helpers.ts b/extensions/telegram/src/bot/helpers.ts
+index 9d7bc09dfe1..2072d707d27 100644
+--- a/extensions/telegram/src/bot/helpers.ts
++++ b/extensions/telegram/src/bot/helpers.ts
+@@ -1,6 +1,5 @@
+ // Telegram helper module supports helpers behavior.
+ import type { Chat, Message } from "grammy/types";
+-import { formatLocationText } from "openclaw/plugin-sdk/channel-inbound";
+ import {
+   resolveCommandAuthorization,
+   type CommandAuthorization,
+@@ -41,6 +40,7 @@ import {
+   joinTelegramTextParts,
+   normalizeForwardedContext,
+   resolveTelegramPrimaryMedia,
++  resolveTelegramNonTextBody,
+   resolveTelegramRichMessageBody,
+   resolveTelegramTextContent,
+   type TelegramForwardedContext,
+@@ -681,10 +681,7 @@ export function describeReplyTarget(msg: Message): TelegramReplyTarget | null {
+     filteredReplyText = hadUnsafeTelegramText(rawReplyText, replyBody);
+     body = replyBody;
+     if (!body) {
+-      const locationData = extractTelegramLocation(replyLike);
+-      if (locationData) {
+-        body = formatLocationText(locationData);
+-      }
++      body = resolveTelegramNonTextBody(replyLike)?.text ?? "";
+     }
+   }
+   if (!body && !replyLike) {
+diff --git a/extensions/telegram/src/message-cache.test.ts b/extensions/telegram/src/message-cache.test.ts
+index 8309663404c..a047460277e 100644
+--- a/extensions/telegram/src/message-cache.test.ts
++++ b/extensions/telegram/src/message-cache.test.ts
+@@ -370,6 +370,30 @@ describe("telegram message cache", () => {
+     ]);
+   });
+ 
++  it("keeps a cached dice roll readable as a reply target", async () => {
++    // The cache derives its own body. Before dice was handled here, replying to a roll
++    // produced a cached node with no body, so the roll never reached the agent as context.
++    const { bucketKey, store } = createMemoryStore();
++    const diceMessage = message(9100, "Ada", {
++      date: 1_736_380_800,
++      from: sender(2, "Ada"),
++      dice: { emoji: "\u{1F3B2}", value: 4 },
++    });
++    const cache = cacheFor(bucketKey, store);
++    await record(cache, diceMessage);
++
++    const chain = await replyChain(
++      cache,
++      message(9101, "Grace", {
++        text: "what did it land on?",
++        from: sender(3, "Grace"),
++        reply_to_message: diceMessage,
++      }),
++    );
++
++    expect(chain.map((node) => node.body)).toEqual(["[Dice \u{1F3B2} = 4]"]);
++  });
++
+   it("records embedded reply targets as normal cached messages", async () => {
+     const { bucketKey, store } = createMemoryStore();
+     const chat = { id: 7, type: "group", title: "Ops" };
+diff --git a/extensions/telegram/src/message-cache.ts b/extensions/telegram/src/message-cache.ts
+index 0c85759fb61..75e9341c1dd 100644
+--- a/extensions/telegram/src/message-cache.ts
++++ b/extensions/telegram/src/message-cache.ts
+@@ -1,18 +1,17 @@
+ // Telegram plugin module implements message cache behavior.
+ import type { Message } from "grammy/types";
+-import { formatLocationText } from "openclaw/plugin-sdk/channel-inbound";
+ import { parseStrictPositiveInteger } from "openclaw/plugin-sdk/number-runtime";
+ import type { MsgContext } from "openclaw/plugin-sdk/reply-runtime";
+ import { logVerbose } from "openclaw/plugin-sdk/runtime-env";
+ import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
+ import {
+   resolveTelegramPrimaryMedia,
++  resolveTelegramNonTextBody,
+   resolveTelegramRichMessageBody,
+   type TelegramMediaKind,
+ } from "./bot/body-helpers.js";
+ import {
+   buildSenderName,
+-  extractTelegramLocation,
+   getTelegramTextParts,
+   normalizeForwardedContext,
+   type TelegramThreadSpec,
+@@ -184,9 +183,9 @@ function resolveMessageBody(msg: Message, preserveWhitespace: boolean): string |
+   if (text.trim()) {
+     return preserveWhitespace ? text : text.trim();
+   }
+-  const location = extractTelegramLocation(msg);
+-  if (location) {
+-    return formatLocationText(location);
++  const nonText = resolveTelegramNonTextBody(msg);
++  if (nonText) {
++    return nonText.text;
+   }
+   return resolveTelegramRichMessageBody(msg);
+ }
+-- 
+2.55.0
+
