@@ -342,22 +342,28 @@ describe("source reply receipts", () => {
     },
   );
 
-  // Dice shares the no-mirroring rule but not the rest of the table's: a roll does deliver
-  // visible content, so it stays a current-source delivery while carrying no transcript text.
-  it("keeps a dice delivery out of the transcript while it carries ignored send text", async () => {
+  // A roll is a delivered source reply, so it is counted for completion, but it owns neither the
+  // transcript nor a restart receipt: the shape below is the one a remote Gateway would admit.
+  it("keeps a dice delivery out of transcript and restart-receipt ownership", async () => {
     const params = source("testchat", "direct:user-1", {
       action: "dice",
       actionParams: { to: "direct:user-1", message: "You rolled a six" },
       sessionKey: "agent:main:testchat:direct:user-1",
+      sessionId: "session-1",
+      sourceReplyFinal: true,
+      toolCallId: "call-1",
       toolContext: {
         currentChannelProvider: "testchat",
         currentChannelId: "direct:user-1",
+        currentSourceTurnId: "source-turn-1",
       },
       deliveredPayload: { ok: true, messageId: "dice-1" },
     });
 
     await expect(mirrorDeliveredSourceReplyToTranscript(params)).resolves.toBe(false);
     expect(transcriptMocks.append).not.toHaveBeenCalled();
+    await expect(beginTerminalSourceReplyDelivery(params)).resolves.toBeUndefined();
+    expect(isDeliveredCurrentSourceReply(params)).toBe(true);
   });
 
   it.each([
