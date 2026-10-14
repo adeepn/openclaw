@@ -168,8 +168,7 @@ describe("outbound policy helpers", () => {
 
   it.each([
     {
-      // A roll is recipient-visible and addressed by `to`; omitting it from the guard set
-      // let a bound run drop out of the check before targets were ever compared.
+      // A roll is recipient-visible and addressed by `to`, so it clears the same guard.
       cfg: {
         ...workspaceConfig,
         tools: {

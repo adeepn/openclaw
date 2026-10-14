@@ -424,8 +424,7 @@ describe("isDeliveredMessageToolOnlySourceReplyResult", () => {
   });
 
   it("accepts a confirmed native send the reply-action name list does not enumerate", () => {
-    // The producer already proved the roll reached this run's conversation; without
-    // trusting that fact the run sends a redundant text reply after the visible send.
+    // The producer already proved the roll reached this run's own conversation.
     expect(
       isDeliveredMessageToolOnlySourceReplyResult({
         sourceReplyDeliveryMode: "message_tool_only",

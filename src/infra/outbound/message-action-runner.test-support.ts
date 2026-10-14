@@ -375,7 +375,12 @@ export async function runReplyAction(params: {
   });
 }
 
-export async function runCurrentConversationPollAction(params: { to: string }) {
+/** Runs a native send addressed at the fixture's own conversation, for completion classification. */
+async function runCurrentConversationAction(
+  action: "dice" | "poll",
+  to: string,
+  actionParams: Record<string, unknown>,
+) {
   const toolContext = {
     currentChannelProvider: "testchat" as const,
     currentChannelId: "direct:user-1",
@@ -383,13 +388,8 @@ export async function runCurrentConversationPollAction(params: { to: string }) {
   };
   return await runFixtureMessageAction({
     cfg: testchatConfig,
-    action: "poll",
-    params: {
-      channel: "testchat",
-      to: params.to,
-      pollQuestion: "Preferred default?",
-      pollOption: ["Tell me right away", "Only important"],
-    },
+    action,
+    params: { channel: "testchat", to, ...actionParams },
     toolContext,
     messageActionAuthorization: {
       requesterAccountId: "default",
@@ -402,26 +402,15 @@ export async function runCurrentConversationPollAction(params: { to: string }) {
   });
 }
 
-export async function runCurrentConversationDiceAction(params: { to: string }) {
-  const toolContext = {
-    currentChannelProvider: "testchat" as const,
-    currentChannelId: "direct:user-1",
-    currentMessageId: "1783",
-  };
-  return await runFixtureMessageAction({
-    cfg: testchatConfig,
-    action: "dice",
-    params: { channel: "testchat", to: params.to, diceEmoji: "\u{1F3B2}" },
-    toolContext,
-    messageActionAuthorization: {
-      requesterAccountId: "default",
-      toolContext,
-    },
-    sessionKey: "agent:main:testchat:direct:user-1",
-    defaultAccountId: "default",
-    sourceReplyDeliveryMode: "message_tool_only",
-    dryRun: false,
+export async function runCurrentConversationPollAction(params: { to: string }) {
+  return await runCurrentConversationAction("poll", params.to, {
+    pollQuestion: "Preferred default?",
+    pollOption: ["Tell me right away", "Only important"],
   });
+}
+
+export async function runCurrentConversationDiceAction(params: { to: string }) {
+  return await runCurrentConversationAction("dice", params.to, { diceEmoji: "\u{1F3B2}" });
 }
 
 /** Returns a bootstrap registry mock for message-action alias tests. */
