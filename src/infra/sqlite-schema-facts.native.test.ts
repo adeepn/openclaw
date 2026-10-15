@@ -173,6 +173,7 @@ describe("native SQLite schema snapshots and callbacks", () => {
       true,
       path.join(root, "second.sqlite"),
     );
+    readSqliteDatabaseScopedWriteToken(second, "existing");
     const cursor = createSqliteDatabaseAdmissionCursor();
     const before = captureSqliteDatabaseAdmissions(cursor);
     const firstSnapshot = before.find((record) => record.location === first.location())!;
@@ -198,6 +199,9 @@ describe("native SQLite schema snapshots and callbacks", () => {
     expect(changed).toHaveLength(1);
     expect(changed[0]!.identity).toBe(secondSnapshot.identity);
     expect(changed[0]!.facts.get(key.name)?.value).toBe(42);
+    expect([...changed[0]!.facts.keys()]).toEqual([key.name]);
+    expect(changed[0]!.writeScopes.size).toBe(0);
+    expect(changed[0]!.references.size).toBe(0);
     expect(getSqliteDatabaseAdmission(second, key)).toBe(42);
     expect(secondSnapshot.facts.has(key.name)).toBe(false);
     expect(
@@ -206,6 +210,17 @@ describe("native SQLite schema snapshots and callbacks", () => {
       ),
     ).toBe(firstSnapshot);
     expect(captureSqliteDatabaseAdmissions(cursor)).toEqual([]);
+
+    readSqliteDatabaseScopedWriteToken(second, "new");
+    const [scopes] = captureSqliteDatabaseAdmissions(cursor);
+    expect([...scopes!.writeScopes.keys()]).toEqual(['["key","new"]']);
+    expect(scopes!.facts.size).toBe(0);
+    expect(scopes!.references.size).toBe(0);
+    const fresh = captureSqliteDatabaseAdmissions(createSqliteDatabaseAdmissionCursor()).find(
+      (record) => record.identity === secondSnapshot.identity,
+    )!;
+    expect(fresh.writeScopes.size).toBe(2);
+    expect(fresh.facts.get(key.name)?.value).toBe(42);
 
     revokeSqliteDatabaseAdmissions(second);
     installSqliteDatabaseAdmissions([]);
@@ -221,31 +236,6 @@ describe("native SQLite schema snapshots and callbacks", () => {
         (record) => record.identity === secondSnapshot.identity,
       ),
     ).toBe(false);
-  });
-
-  it("reclaims another isolate's retired metadata at the next publication", () => {
-    const root = tempDirs.make("sqlite-retired-publication-");
-    const first = openDatabase("CREATE TABLE proof(value)", true, path.join(root, "first.sqlite"));
-    const second = openDatabase(
-      "CREATE TABLE proof(value)",
-      true,
-      path.join(root, "second.sqlite"),
-    );
-    const firstSnapshot = captureSqliteDatabaseAdmissions(undefined, {
-      location: first.location()!,
-    })[0]!;
-    const secondSnapshot = captureSqliteDatabaseAdmissions(undefined, {
-      location: second.location()!,
-    })[0]!;
-    const receiver = new SqliteDatabaseAdmissionRegistry();
-    receiver.install(structuredClone([firstSnapshot, secondSnapshot]));
-    try {
-      first.close();
-      receiver.publish(receiver.records.get(secondSnapshot.identity)!);
-      expect(receiver.records.has(firstSnapshot.identity)).toBe(false);
-    } finally {
-      captureSqliteDatabaseAdmissions();
-    }
   });
 
   it("installs a recreated scope when only the sender's latest publication is delivered", () => {

@@ -25,7 +25,6 @@ import {
   getAdmittedSqliteSchemaFacts,
   getSqliteReadOperationRevision,
   installSqliteTempTrackingSchema,
-  readSqliteDataVersion,
   registerSqliteSchemaMutationListener,
   runSqliteReadOperationSync,
 } from "./sqlite-schema-facts.js";
@@ -74,7 +73,7 @@ describe("admitted SQLite schema facts", () => {
     }
   });
 
-  it("shares validation across open handles and revalidates after final close or replacement", () => {
+  it("retains validation across closed handles and refreshes after DDL or replacement", () => {
     const root = tempDirs.make("openclaw-schema-process-");
     const filename = path.join(root, "state.sqlite");
     const first = openDatabase(undefined, true, filename);
@@ -93,12 +92,17 @@ describe("admitted SQLite schema facts", () => {
       first.close();
       const reopened = openDatabase("", true, filename);
       expect(tableExists(reopened, "original")).toBe(true);
-      expect(validations()).toHaveLength(1);
+      expect(validations()).toHaveLength(0);
       const sibling = openDatabase("", true, filename);
       expect(tableExists(sibling, "original")).toBe(true);
-      expect(validations()).toHaveLength(1);
+      expect(validations()).toHaveLength(0);
       sibling.close();
+      reopened.exec("CREATE TABLE added (id)");
       reopened.close();
+      const afterDdl = openDatabase("", true, filename);
+      expect(tableExists(afterDdl, "added")).toBe(true);
+      expect(validations()).toHaveLength(1);
+      afterDdl.close();
 
       const replacementPath = path.join(root, "replacement.sqlite");
       const replacement = new DatabaseSync(replacementPath);
@@ -112,7 +116,7 @@ describe("admitted SQLite schema facts", () => {
       replaced.close();
       const replacementReopened = openDatabase("", true, filename);
       expect(tableExists(replacementReopened, "replacement")).toBe(true);
-      expect(validations()).toHaveLength(3);
+      expect(validations()).toHaveLength(2);
     } finally {
       observation.restore();
     }
@@ -346,22 +350,6 @@ describe("admitted SQLite schema facts", () => {
       observation.restore();
     }
   });
-  it.each(["data_version"])(
-    "uses native freshness without consulting a table shadowing %s",
-    (name) => {
-      const database = openDatabase(
-        `CREATE TABLE original (id); CREATE TABLE pragma_${name} (${name} INTEGER);
-         INSERT INTO pragma_${name} VALUES (999); PRAGMA user_version = 1;`,
-      );
-      expect(runSqliteReadOperationSync(database, () => tableExists(database, "original"))).toBe(
-        true,
-      );
-      expect(readSqliteDataVersion(database)).not.toBe(999);
-      expect(getAdmittedSqliteSchemaFacts(database)?.userVersion).toBe(1);
-      expect(getAdmittedSqliteSchemaFacts(database)?.textEncoding).toBe("UTF-8");
-    },
-  );
-
   it.each(["transaction", "implicit snapshot"])(
     "refreshes foreign row commits while trusting admitted format through an active %s",
     (pin) => {
