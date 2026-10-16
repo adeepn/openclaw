@@ -20,7 +20,6 @@ import {
   logVerbose,
   shouldLogVerbose,
   getChildLogger,
-  createSubsystemLogger,
   createNonExitingRuntime,
   type RuntimeEnv,
 } from "openclaw/plugin-sdk/runtime-env";
@@ -61,7 +60,6 @@ import {
   prepareTelegramPollAnswerContextAsync,
   settleTelegramPollAnswerContext,
 } from "./poll-answer-context.js";
-import { formatTelegramRawUpdateForLog } from "./raw-update-log.js";
 import type { TelegramSendChatActionHandler } from "./sendchataction-401-backoff.js";
 import { createTelegramSequentializer } from "./sequentialize.js";
 import { createTelegramThreadBindingManager } from "./thread-bindings.js";
@@ -237,19 +235,6 @@ export async function createTelegramBotCore(
     await next();
   });
 
-  const rawUpdateLogger = createSubsystemLogger("gateway/channels/telegram/raw-update");
-
-  bot.use(async (ctx, next) => {
-    if (shouldLogVerbose()) {
-      try {
-        rawUpdateLogger.debug(`telegram update: ${formatTelegramRawUpdateForLog(ctx.update)}`);
-      } catch (err) {
-        rawUpdateLogger.debug(`telegram update log failed: ${String(err)}`);
-      }
-    }
-    await next();
-  });
-
   const nativeEnabled = resolveNativeCommandsEnabled({
     providerId: "telegram",
     providerSetting: telegramCfg.commands?.native,
@@ -278,7 +263,7 @@ export async function createTelegramBotCore(
     const storePath = telegramDeps.resolveStorePath(params.cfg.session?.store, { agentId });
     try {
       const storedActivation = (
-        await telegramDeps.getSessionEntryAsync?.({
+        await telegramDeps.getSessionEntryAsync({
           storePath,
           sessionKey: params.sessionKey,
         })
@@ -333,6 +318,7 @@ export async function createTelegramBotCore(
       shouldSkipUpdate,
       telegramDeps: {
         ...telegramDeps,
+        runModelsAuthLoginFlow: defaultTelegramNativeCommandDeps.runModelsAuthLoginFlow,
         sendMessageTelegram: defaultTelegramNativeCommandDeps.sendMessageTelegram,
       },
     });

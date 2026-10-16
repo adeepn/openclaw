@@ -13,12 +13,8 @@ import type {
   prepareMemoryIndexChunks,
 } from "./manager-index-preparation.js";
 import type { MemoryIndexReadCommand, MemoryIndexReadOperations } from "./manager-index-read.js";
-import type {
-  MemoryKeywordWorkerQuery,
-  MemorySearchWorkerInput,
-  MemorySearchWorkerOutput,
-  MemoryVectorWorkerQuery,
-} from "./manager-search.worker.js";
+import type { MemoryKeywordWorkerQuery, MemoryVectorWorkerQuery } from "./manager-search-types.js";
+import type { MemorySearchWorkerInput, MemorySearchWorkerOutput } from "./manager-search.worker.js";
 import type { MemoryStatusQuery } from "./manager-status-state.js";
 const MEMORY_INDEX_WORKER_INPUT_LIMIT_BYTES = 256 * 1024 * 1024;
 
@@ -41,14 +37,12 @@ const retrieval = new WorkerTaskPool<MemorySearchWorkerInput, MemorySearchWorker
   workerUrl: resolveRuntimeWorkerUrl(memoryCpuProcessEntrypoints.search),
   workerClass: "reader",
   sharedCompute: true,
-  databaseAccess: "read-only",
 });
 // Background chunk preparation must not occupy the foreground retrieval worker.
 const indexing = new WorkerTaskPool<MemoryIndexTask, MemoryIndexTaskResult>({
   workerUrl: resolveRuntimeWorkerUrl(memoryCpuProcessEntrypoints.index),
   workerClass: "compute",
   sharedCompute: true,
-  databaseAccess: "read-only",
   maxPendingBytes: MEMORY_INDEX_WORKER_INPUT_LIMIT_BYTES,
 });
 
