@@ -44,6 +44,33 @@ export function createOperationsRecorders(runtime: DiagnosticsRecorderRuntime) {
   };
 
   return {
+    recordSessionsListBaselineRetired(
+      evt: Extract<DiagnosticEventPayload, { type: "sessions.list.baseline.retired" }>,
+      metadata: DiagnosticEventMetadata,
+    ) {
+      if (metadata.trusted) {
+        runtime.sessionsListBaselineRetirementsCounter.add(1, { cause: evt.cause });
+      }
+    },
+    recordGatewayWsEvent(
+      evt: Extract<DiagnosticEventPayload, { type: "gateway.ws.event" }>,
+      metadata: DiagnosticEventMetadata,
+    ) {
+      if (!metadata.trusted) {
+        return;
+      }
+      const attrs = { "openclaw.gateway.ws.event": evt.event };
+      runtime.gatewayWsEventsCounter.add(evt.count, attrs);
+      runtime.gatewayWsEventBytesCounter.add(evt.bytes, attrs);
+    },
+    recordGatewayWsConnections(
+      evt: Extract<DiagnosticEventPayload, { type: "gateway.ws.connections" }>,
+      metadata: DiagnosticEventMetadata,
+    ) {
+      if (metadata.trusted) {
+        runtime.gatewayWsOperatorConnectionsGauge.record(evt.operators);
+      }
+    },
     recordGatewayRpc(
       evt: Extract<DiagnosticEventPayload, { type: "gateway.rpc" }>,
       metadata: DiagnosticEventMetadata,
@@ -63,6 +90,11 @@ export function createOperationsRecorders(runtime: DiagnosticsRecorderRuntime) {
       runtime.gatewayRpcOutcomesCounter.add(1, outcomeAttrs);
       switch (evt.phase) {
         case "response":
+          if (evt.outcome === "ok" && evt.sessionsList?.baseMissReason) {
+            runtime.sessionsListBaseMissesCounter.add(1, {
+              reason: evt.sessionsList.baseMissReason,
+            });
+          }
           if (evt.outcome === "ok" || evt.outcome === "error") {
             runtime.gatewayRpcFirstResponseHistogram.record(evt.durationMs, attrs);
           }
